@@ -173,12 +173,20 @@ function AngleSection({ t }: { t: 0 | 1 }) {
 
 // ガイド付き自動キャリブレーション:
 //   1) 中央で2秒静止 -> center を平均から取得
-//   2) ぐるぐる回して端まで倒す -> min/max を追跡、終了ボタンで書き込み
+//   2) ぐるぐる回して端まで倒す -> min/max を追跡（スパイクフィルタ付き）
+//   3) 測定値と妥当性チェックを確認してから書き込み
+const CAL_MIN_SPAN = 6000;   // 中央から各端まで最低限必要な振れ幅 (raw, ~9%FS)
+const CAL_SPIKE_JUMP = 20000; // 前サンプルからこれ以上飛んだ値はグリッチとして無視
+
 function CalibrationWizard({ t }: { t: 0 | 1 }) {
 	useConfig();
-	const [phase, setPhase] = useState<'idle' | 'center' | 'range'>('idle');
+	const [phase, setPhase] = useState<'idle' | 'center' | 'range' | 'confirm'>('idle');
 	const [progress, setProgress] = useState('');
-	const meas = useRef({ ctrX: 0, ctrY: 0, mnX: 0, mxX: 0, mnY: 0, mxY: 0, timer: 0 as ReturnType<typeof setInterval> | 0 });
+	const meas = useRef({
+		ctrX: 0, ctrY: 0, mnX: 0, mxX: 0, mnY: 0, mxY: 0,
+		prevX: -1, prevY: -1,
+		timer: 0 as ReturnType<typeof setInterval> | 0,
+	});
 
 	const channels = () => {
 		const chX = bs.getVal(2, t === 0 ? GP.chLX : GP.chRX);
@@ -218,18 +226,42 @@ function CalibrationWizard({ t }: { t: 0 | 1 }) {
 		const m = meas.current;
 		m.mnX = m.mxX = m.ctrX;
 		m.mnY = m.mxY = m.ctrY;
+		m.prevX = m.prevY = -1;
 		m.timer = setInterval(() => {
 			if (bs.live.valid) {
 				const x = bs.live.ch[chX], y = bs.live.ch[chY];
-				m.mnX = Math.min(m.mnX, x); m.mxX = Math.max(m.mxX, x);
-				m.mnY = Math.min(m.mnY, y); m.mxY = Math.max(m.mxY, y);
+				// ADCグリッチ対策: 前サンプルから急激に飛んだ値は捨てる
+				// (ゆっくり回す前提。連続した実移動なら次サンプルで追いつく)
+				if (m.prevX < 0 || Math.abs(x - m.prevX) <= CAL_SPIKE_JUMP) {
+					m.mnX = Math.min(m.mnX, x); m.mxX = Math.max(m.mxX, x);
+				}
+				if (m.prevY < 0 || Math.abs(y - m.prevY) <= CAL_SPIKE_JUMP) {
+					m.mnY = Math.min(m.mnY, y); m.mxY = Math.max(m.mxY, y);
+				}
+				m.prevX = x; m.prevY = y;
 			}
 			setProgress(`X: ${m.mnX} .. ${m.ctrX} .. ${m.mxX}\nY: ${m.mnY} .. ${m.ctrY} .. ${m.mxY}`);
 		}, 50);
 	};
 
-	const finish = () => {
+	// 中央から各端までの振れ幅が十分あるか
+	const validation = () => {
+		const m = meas.current;
+		const spans: [string, number][] = [
+			['X-側', m.ctrX - m.mnX], ['X+側', m.mxX - m.ctrX],
+			['Y-側', m.ctrY - m.mnY], ['Y+側', m.mxY - m.ctrY],
+		];
+		return spans.filter(([, span]) => span < CAL_MIN_SPAN);
+	};
+
+	const toConfirm = () => {
 		stop();
+		setPhase('confirm');
+		const m = meas.current;
+		setProgress(`X: ${m.mnX} .. ${m.ctrX} .. ${m.mxX}\nY: ${m.mnY} .. ${m.ctrY} .. ${m.mxY}`);
+	};
+
+	const write = () => {
 		const m = meas.current;
 		bs.setParam(t, SP.calMinX, 0, m.mnX);
 		bs.setParam(t, SP.calCenterX, 0, m.ctrX);
@@ -245,6 +277,8 @@ function CalibrationWizard({ t }: { t: 0 | 1 }) {
 
 	useEffect(() => () => stop(), []);
 
+	const bad = phase === 'confirm' ? validation() : [];
+
 	return (
 		<div className="card">
 			<h3>自動キャリブレーション</h3>
@@ -259,7 +293,25 @@ function CalibrationWizard({ t }: { t: 0 | 1 }) {
 				<>
 					<div className="note">スティックをゆっくり数回、外周に沿って回してください（全方向で端まで倒す）。</div>
 					<div className="row">
-						<button className="primary" onClick={finish}>計測終了して書き込み</button>
+						<button className="primary" onClick={toConfirm}>計測終了</button>
+						<button onClick={cancel}>キャンセル</button>
+					</div>
+				</>
+			)}
+			{phase === 'confirm' && (
+				<>
+					{bad.length > 0 ? (
+						<div className="note" style={{ color: 'var(--err)' }}>
+							計測範囲が狭すぎます: {bad.map(([name]) => name).join(', ')}
+							（中央から{CAL_MIN_SPAN}カウント未満）。スティックが端まで倒れていないか、
+							計測中にデータが乱れています。書き込まずにやり直してください。
+						</div>
+					) : (
+						<div className="note">この値を書き込みます。よければ「書き込み」を押してください。</div>
+					)}
+					<div className="row">
+						<button className="primary" onClick={write} disabled={bad.length > 0}>書き込み</button>
+						<button onClick={startCenter}>やり直す</button>
 						<button onClick={cancel}>キャンセル</button>
 					</div>
 				</>
