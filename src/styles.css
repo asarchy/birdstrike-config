@@ -144,3 +144,60 @@ canvas.curve {
 .overlay .box { text-align: center; }
 .overlay .box button { font-size: 16px; padding: 12px 34px; }
 .overlay p { color: var(--muted); margin: 14px 0 0; line-height: 1.7; }
+
+/* --- コンバーター: コントローラー / ゲート較正 --- */
+.verdict strong { display: block; margin-bottom: 4px; }
+.verdict.ok    { border-left: 3px solid var(--ok); }
+.verdict.warn  { border-left: 3px solid var(--accent2); }
+.verdict.err   { border-left: 3px solid var(--err); }
+.verdict .note { margin: 0; }
+
+table.kv { width: 100%; border-collapse: collapse; }
+table.kv th {
+	text-align: left; font-weight: 400; color: var(--muted);
+	padding: 5px 10px 5px 0; white-space: nowrap;
+}
+table.kv td { padding: 5px 0; }
+.mono { font-family: Consolas, monospace; }
+.dim { color: var(--muted); }
+
+.gateWrap { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+.gateSide { flex: 0 0 auto; position: sticky; top: 12px; }
+.gateContent { flex: 1 1 380px; min-width: 0; }
+.gateCanvas { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+.gateLegend {
+	display: flex; flex-wrap: wrap; gap: 10px;
+	margin-top: 8px; font-size: 11px; color: var(--muted);
+}
+.gateLegend span { display: flex; align-items: center; gap: 5px; }
+.gateLegend i.sw { width: 12px; height: 0; border-top: 2px solid; display: inline-block; }
+.gateLegend i.orange { border-color: #f0883e; }
+.gateLegend i.blue   { border-color: #58a6ff; }
+.gateLegend i.red    { border-color: rgba(255, 107, 107, 0.6); }
+.gateLegend i.dash   { border-color: #5a6373; border-top-style: dashed; }
+
+ol.steps { margin: 0 0 12px; padding-left: 20px; }
+ol.steps li { margin: 7px 0; color: var(--muted); line-height: 1.5; }
+ol.steps li strong { display: block; color: var(--muted); font-weight: 600; }
+ol.steps li span { font-size: 11px; }
+ol.steps li.now strong { color: var(--accent); }
+ol.steps li.done strong { color: var(--ok); }
+ol.steps li.done::marker { content: '✓ '; }
+
+.progress { display: flex; align-items: center; gap: 10px; margin: 12px 0; }
+.progress .bar {
+	flex: 1; height: 8px; background: var(--panel2);
+	border-radius: 4px; overflow: hidden;
+}
+.progress .fill { height: 100%; background: var(--accent2); transition: width .15s linear; }
+.progress span { flex: 0 0 auto; font-size: 11px; color: var(--muted); }
+
+.btnRow { display: flex; gap: 8px; flex-wrap: wrap; }
+
+table.gateTable th { text-align: right; padding-right: 8px; font-size: 11px; }
+table.gateTable td { padding-right: 18px; }
+
+.board {
+	font-size: 11px; padding: 2px 8px; border-radius: 10px;
+	background: var(--panel2); color: var(--muted); border: 1px solid var(--border);
+}

@@ -13,6 +13,7 @@ import { useSyncExternalStore } from 'react';
 const REPORT_SET = 0x60;
 const REPORT_GET = 0x61;
 const CMD_SET = 0x01, CMD_SAVE = 0x02, CMD_SELECT = 0x03, CMD_REBOOT = 0x04, CMD_SET_INPUT_MODE = 0x05;
+const CMD_CAL_START = 0x06, CMD_CAL_SAVE = 0x07, CMD_CAL_ABORT = 0x08;
 
 // InputMode enum (enums.proto) のうちツールから切り替えを提供するもの
 export const INPUT_MODES: [number, string][] = [
@@ -26,7 +27,14 @@ export const INPUT_MODES: [number, string][] = [
 	[14, 'Generic HID (DInput)'],
 	[3, 'キーボード'],
 ];
-const SEL_INFO = 0x00, SEL_RAW = 0x01, SEL_DUMP = 0x03;
+const SEL_INFO = 0x00, SEL_RAW = 0x01, SEL_DUMP = 0x03, SEL_HOST = 0x04;
+
+// 基板の種類 (INFO byte 10)。コンバーターはスティックが USB ホストにつないだ
+// コントローラーから来るので、専用の画面が要る
+export const BOARD_PAD = 0, BOARD_CONVERTER = 1;
+
+// ゲート較正で測る方向の数 (ファーム HML_GATE_BINS と一致させること)
+export const GATE_BINS = 16;
 
 export const SP = {
 	calMinX: 1, calCenterX: 2, calMaxX: 3, calMinY: 4, calCenterY: 5, calMaxY: 6,
@@ -82,6 +90,21 @@ export interface LiveData {
 	diag: AdsDiag;
 }
 
+// USB ホストにつないだコントローラーの状態とゲート較正の進み具合
+export interface HostData {
+	seen: boolean;      // USB スタックから渡されたか
+	hid: boolean;       // false = XInput 系 (ベンダークラス) で来た
+	vid: number;
+	pid: number;
+	driver: string;     // 掴んだドライバ / 'none' / 'busy' / 'auth-dongle'
+	calActive: boolean;
+	calStick: number;
+	coverage: number;   // 測定済み方向の割合 (%)
+	center: [number, number];
+	raw: { lx: number; ly: number; rx: number; ry: number }; // 整形前の生値
+	radius: number[];   // 方向ごとのゲート半径 (1/1000 フルスケール)
+}
+
 export interface StickView {
 	rawX: number | null; // 生 ADC 値
 	rawY: number | null;
@@ -117,6 +140,13 @@ class Birdstrike {
 	deviceName = '';
 	inputMode = -1; // INFO 応答の現在モード (-1 = 不明)
 	protocolVersion = 0; // ファーム側設定チャンネルのバージョン
+	boardKind = BOARD_PAD; // INFO 応答の基板種別
+	host: HostData = {
+		seen: false, hid: false, vid: 0, pid: 0, driver: 'none',
+		calActive: false, calStick: 0, coverage: 0, center: [0, 0],
+		raw: { lx: 32768, ly: 32768, rx: 32768, ry: 32768 },
+		radius: new Array(GATE_BINS).fill(0),
+	};
 	static readonly REQUIRED_VERSION = 2; // モード切替/再起動に必要
 	// 波形ビュー: 直近 HISTORY_LEN サンプルのリングバッファ
 	history: [StickSample, StickSample][] = [];
@@ -266,11 +296,43 @@ class Birdstrike {
 					{ nx: v1.nx, ny: v1.ny, ox: v1.ox, oy: v1.oy },
 				]);
 				if (this.history.length > HISTORY_LEN) this.history.shift();
-				this.emitLive();
 			});
+			// コンバーターだけ、ホスト側コントローラーと較正の状態も取る
+			if (this.isConverter) await this.pollHost();
+			this.emitLive();
 		} catch {
 			/* 一時的な失敗は無視して次のポーリングへ */
 		}
+	}
+
+	private async pollHost() {
+		await this.enqueue(async () => {
+			await this.select(SEL_HOST);
+			const dv = await this.receiveReport();
+			if (dv.getUint8(0) !== SEL_HOST) return;
+			let driver = '';
+			for (let i = 0; i < 12; i++) {
+				const c = dv.getUint8(7 + i);
+				if (c === 0) break;
+				driver += String.fromCharCode(c);
+			}
+			this.host = {
+				seen: dv.getUint8(1) !== 0,
+				hid: dv.getUint8(2) !== 0,
+				vid: dv.getUint16(3, true),
+				pid: dv.getUint16(5, true),
+				driver: driver || 'none',
+				calActive: dv.getUint8(19) !== 0,
+				calStick: dv.getUint8(20),
+				coverage: dv.getUint8(21),
+				center: [dv.getUint16(22, true), dv.getUint16(24, true)],
+				raw: {
+					lx: dv.getUint16(26, true), ly: dv.getUint16(28, true),
+					rx: dv.getUint16(30, true), ry: dv.getUint16(32, true),
+				},
+				radius: Array.from({ length: GATE_BINS }, (_, i) => dv.getUint16(34 + i * 2, true)),
+			};
+		});
 	}
 
 	private calNorm(raw: number, mn: number, ctr: number, mx: number): number {
@@ -280,6 +342,19 @@ class Birdstrike {
 	}
 
 	stickView(t: 0 | 1): StickView {
+		// コンバーターには ADC が無い。生値はホスト側コントローラーの整形前の
+		// 値そのもので、中心・範囲はゲートプロファイル側が持つ
+		if (this.isConverter) {
+			const rx = t === 0 ? this.host.raw.lx : this.host.raw.rx;
+			const ry = t === 0 ? this.host.raw.ly : this.host.raw.ry;
+			const outX = t === 0 ? this.live.out.lx : this.live.out.rx;
+			const outY = t === 0 ? this.live.out.ly : this.live.out.ry;
+			return {
+				rawX: rx, rawY: ry,
+				nx: (rx - 32768) / 32768, ny: (ry - 32768) / 32768,
+				ox: (outX - 32768) / 32768, oy: (outY - 32768) / 32768, outX, outY,
+			};
+		}
 		const chX = this.getVal(2, t === 0 ? GP.chLX : GP.chRX);
 		const chY = this.getVal(2, t === 0 ? GP.chLY : GP.chRY);
 		const rawOf = (c: number) => (this.live.valid && c >= 0 && c < 8 ? this.live.ch[c] : null);
@@ -295,6 +370,36 @@ class Birdstrike {
 		const outX = t === 0 ? this.live.out.lx : this.live.out.rx;
 		const outY = t === 0 ? this.live.out.ly : this.live.out.ry;
 		return { rawX, rawY, nx, ny, ox: (outX - 32768) / 32768, oy: (outY - 32768) / 32768, outX, outY };
+	}
+
+	get isConverter() { return this.boardKind === BOARD_CONVERTER; }
+
+	// --- ゲート較正 ---
+	// 手順: calStart → スティックから手を離して中心を取らせる → ゲートに沿って
+	// 一周させ coverage が 100 になったら calSave
+	async calStart(stick: 0 | 1) {
+		await this.enqueue(() => this.sendReport([CMD_CAL_START, stick]))
+			.catch((e) => this.setStatus(`較正開始に失敗: ${e.message}`, 'err'));
+		this.setStatus('較正中: スティックから手を離してください');
+	}
+
+	async calAbort() {
+		await this.enqueue(() => this.sendReport([CMD_CAL_ABORT]))
+			.catch(() => {});
+		this.setStatus('較正を中止しました');
+	}
+
+	// 全方向が埋まっていないとファーム側が保存を拒否する
+	async calSave(): Promise<boolean> {
+		if (this.host.coverage < 100) {
+			this.setStatus('まだ測れていない方向があります', 'err');
+			return false;
+		}
+		await this.enqueue(() => this.sendReport([CMD_CAL_SAVE]))
+			.catch((e) => this.setStatus(`保存に失敗: ${e.message}`, 'err'));
+		this.snapshotBaseline();
+		this.setStatus('ゲート較正を保存しました', 'ok');
+		return true;
 	}
 
 	// --- 接続まわり ---
@@ -341,6 +446,8 @@ class Birdstrike {
 				throw new Error('このファームウェアは設定チャンネル未対応です');
 			this.protocolVersion = info.getUint8(5);
 			this.inputMode = info.getUint8(9);
+			// v4 より前は基板種別を返さないので、パッドとして扱う
+			this.boardKind = this.protocolVersion >= 4 ? info.getUint8(10) : BOARD_PAD;
 			for (const t of [0, 1, 2]) this.state[t] = await this.dumpTarget(t);
 		});
 		this.snapshotBaseline();

@@ -100,6 +100,9 @@ export function SystemPage() {
 		<div>
 			<InputModeCard />
 			<ModeComboCard />
+			{/* ライトバー・アナログボタン・ADC はパッド基板の実装。コンバーターには
+			    無いので出さない（設定できてしまうと誤解を招く） */}
+			{!bs.isConverter && <>
 			<div className="card">
 				<h3>ライトバー</h3>
 				<CheckRow t={2} id={GP.lightbarEnabled} label="有効" />
@@ -116,6 +119,7 @@ export function SystemPage() {
 				<CheckRow t={2} id={GP.r3ActiveHigh} label="R3 アクティブHigh" />
 			</div>
 			<AdsDiagCard />
+			</>}
 			<div className="card">
 				<h3>メンテナンス</h3>
 				<div className="row">
