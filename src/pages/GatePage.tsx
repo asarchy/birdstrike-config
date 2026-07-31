@@ -5,7 +5,7 @@
 // した半径で割ると、どの方向でも・どの機種でも「いっぱいまで倒す = 1.0」に
 // 揃い、そこから先の角張り具合は対角スケールで好きに作れる。
 import { useState } from 'react';
-import { bs, useLive, useConfig, GATE_BINS } from '../birdstrike';
+import { bs, useLive, useConfig, GATE_BINS, DRV } from '../birdstrike';
 import { GateCanvas } from '../components/GateCanvas';
 
 type Phase = 'idle' | 'center' | 'sweep' | 'done';
@@ -23,7 +23,8 @@ export function GatePage() {
 		: (centered ? 'sweep' : 'center');
 
 	const measured = h.radius.filter((r) => r > 0).length;
-	const canStart = h.seen && h.driver !== 'none' && h.driver !== 'busy' && h.driver !== 'auth-dongle';
+	const canStart = h.seen && h.driver !== DRV.NONE
+		&& h.driver !== DRV.BUSY && h.driver !== DRV.AUTH_DONGLE;
 
 	return (
 		<>

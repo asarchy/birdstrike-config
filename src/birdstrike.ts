@@ -36,6 +36,12 @@ export const BOARD_PAD = 0, BOARD_CONVERTER = 1;
 // ゲート較正で測る方向の数 (ファーム HML_GATE_BINS と一致させること)
 export const GATE_BINS = 16;
 
+// ファーム GamepadUSBHostListener::HostDriver と一致させること
+export const DRV = {
+	NONE: 0, BUSY: 1, AUTH_DONGLE: 2, DS4: 3, DUALSENSE: 4, SWITCHPRO: 5,
+	XBOX360: 6, STADIA: 7, DRIVINGFORCE: 8, ULTRASTIK360: 9, GENERIC: 10,
+} as const;
+
 export const SP = {
 	calMinX: 1, calCenterX: 2, calMaxX: 3, calMinY: 4, calCenterY: 5, calMaxY: 6,
 	innerDeadzone: 7, outerDeadzone: 8, curvePreset: 9, curvePointCount: 10,
@@ -96,7 +102,7 @@ export interface HostData {
 	hid: boolean;       // false = XInput 系 (ベンダークラス) で来た
 	vid: number;
 	pid: number;
-	driver: string;     // 掴んだドライバ / 'none' / 'busy' / 'auth-dongle'
+	driver: number;     // HostDriver コード (DRV_*)
 	calActive: boolean;
 	calStick: number;
 	coverage: number;   // 測定済み方向の割合 (%)
@@ -142,7 +148,7 @@ class Birdstrike {
 	protocolVersion = 0; // ファーム側設定チャンネルのバージョン
 	boardKind = BOARD_PAD; // INFO 応答の基板種別
 	host: HostData = {
-		seen: false, hid: false, vid: 0, pid: 0, driver: 'none',
+		seen: false, hid: false, vid: 0, pid: 0, driver: 0,
 		calActive: false, calStick: 0, coverage: 0, center: [0, 0],
 		raw: { lx: 32768, ly: 32768, rx: 32768, ry: 32768 },
 		radius: new Array(GATE_BINS).fill(0),
@@ -310,27 +316,21 @@ class Birdstrike {
 			await this.select(SEL_HOST);
 			const dv = await this.receiveReport();
 			if (dv.getUint8(0) !== SEL_HOST) return;
-			let driver = '';
-			for (let i = 0; i < 12; i++) {
-				const c = dv.getUint8(7 + i);
-				if (c === 0) break;
-				driver += String.fromCharCode(c);
-			}
 			this.host = {
 				seen: dv.getUint8(1) !== 0,
 				hid: dv.getUint8(2) !== 0,
 				vid: dv.getUint16(3, true),
 				pid: dv.getUint16(5, true),
-				driver: driver || 'none',
-				calActive: dv.getUint8(19) !== 0,
-				calStick: dv.getUint8(20),
-				coverage: dv.getUint8(21),
-				center: [dv.getUint16(22, true), dv.getUint16(24, true)],
+				driver: dv.getUint8(7),
+				calActive: dv.getUint8(8) !== 0,
+				calStick: dv.getUint8(9),
+				coverage: dv.getUint8(10),
+				center: [dv.getUint16(11, true), dv.getUint16(13, true)],
 				raw: {
-					lx: dv.getUint16(26, true), ly: dv.getUint16(28, true),
-					rx: dv.getUint16(30, true), ry: dv.getUint16(32, true),
+					lx: dv.getUint16(15, true), ly: dv.getUint16(17, true),
+					rx: dv.getUint16(19, true), ry: dv.getUint16(21, true),
 				},
-				radius: Array.from({ length: GATE_BINS }, (_, i) => dv.getUint16(34 + i * 2, true)),
+				radius: Array.from({ length: GATE_BINS }, (_, i) => dv.getUint16(23 + i * 2, true)),
 			};
 		});
 	}
