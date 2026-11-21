@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { bs, useConfig, GP, SP, CURVE_PRESETS } from '../birdstrike';
+import { bs, useConfig, GP, SP, CURVE_PRESETS, CURVE_PRESETS_V5, CURVE_SLOT_POINTS, OVERSAMPLING } from '../birdstrike';
 import { SliderRow, NumberRow, CheckRow, SelectRow, PointsTable } from '../components/Controls';
 import { StickCanvas } from '../components/StickCanvas';
 import { CurveCanvas } from '../components/CurveCanvas';
@@ -35,7 +35,24 @@ function BasicSection({ t }: { t: 0 | 1 }) {
 
 function CurveSection({ t }: { t: 0 | 1 }) {
 	useConfig();
-	const isCustom = bs.getVal(t, SP.curvePreset) >= 5;
+	const preset = bs.getVal(t, SP.curvePreset);
+	const isCustom = preset >= 5;
+	if (bs.hasV5) {
+		// ch v5: カスタム 4 枠、0.1% 単位 (FireBird A* と同じ)
+		const slot = Math.min(Math.max(preset - 5, 0), 3);
+		return (
+			<div className="card">
+				<SelectRow t={t} id={SP.curvePreset} label="プリセット" options={CURVE_PRESETS_V5} />
+				<CurveCanvas stick={t} />
+				{isCustom && (
+					<PointsTable t={t} idX={SP.curvesX} idY={SP.curvesY} idCount={SP.curvesCount}
+						base={slot * CURVE_SLOT_POINTS} countIdx={slot} scale={10} step={0.1}
+						maxPts={CURVE_SLOT_POINTS} countLabel="ポイント数" xLabel="入力 %" yLabel="出力 %" />
+				)}
+				<div className="note">座標は 0.0〜100.0% を 0.1% 単位で指定できます。</div>
+			</div>
+		);
+	}
 	return (
 		<div className="card">
 			<SelectRow t={t} id={SP.curvePreset} label="プリセット"
@@ -78,6 +95,12 @@ function RcSection({ t }: { t: 0 | 1 }) {
 			</div>
 			<div className="card">
 				<h3>出力・遅延</h3>
+				{bs.hasV5 && (
+					<>
+						<SelectRow t={t} id={SP.oversampling} label="オーバーサンプリング" options={OVERSAMPLING} />
+						<div className="note">ADC の読み取り値を移動平均して静止時のブレを減らします。平均する回数を増やすほど、わずかに遅延が増えます（16 回で約 1.3ms）。</div>
+					</>
+				)}
 				<SliderRow t={t} id={SP.resolution} label="出力分解能 (0=無制限)" min={0} max={128} />
 				<SliderRow t={t} id={SP.delayMs} label="入力遅延 ms" min={0} max={40} />
 				<CheckRow t={t} id={SP.invertX} label="X軸 反転" />
@@ -160,16 +183,157 @@ function AngleMapTable({ t }: { t: 0 | 1 }) {
 }
 
 function AngleSection({ t }: { t: 0 | 1 }) {
+	useConfig();
+	return (
+		<>
+			{bs.hasV5 && <AngleCalWizard t={t} />}
+			<div className="card">
+				<SliderRow t={t} id={SP.angleOffset100} label="全体回転 (度)" min={-180} max={180} scale={100} step={0.5} />
+				<SelectRow t={t} id={SP.angleSnap} label="角度スナップ"
+					options={[[0, 'オフ'], [1, '45度'], [2, '90度']]} />
+				<div className="hr" />
+				<AngleMapTable t={t} />
+			</div>
+		</>
+	);
+}
+
+// 8 方向の角度キャリブレーション (ch v5):
+//   各方向に倒し切って静止 -> 角度補正直前のベクトルから角度を測る
+//   -> 測った角度を 45 度の倍数へ写す角度マップ (8 点) を書き込む
+// 目標角は測定角を 45 度単位に丸めて決めるので、ファーム側の角度の取り方
+// (0 度がどちらか) に依存しない。
+const CAL_DIRS = ['上', '右上', '右', '右下', '下', '左下', '左', '左上'];
+const ANGLE_CAL_MIN_MAG = 0.85;  // 倒し切りとみなす大きさ
+const ANGLE_CAL_STABLE = 10;     // 連続サンプル数 (50ms 間隔 = 0.5 秒)
+const ANGLE_CAL_SPREAD = 2.0;    // その間の角度のばらつき上限 (度)
+
+const angleOf = (x: number, y: number) => {
+	// ファームと同じ: atan2(x, y)、0..360
+	const a = Math.atan2(x, y) * 180 / Math.PI;
+	return a < 0 ? a + 360 : a;
+};
+const angDiff = (a: number, b: number) => {
+	let d = a - b;
+	while (d > 180) d -= 360;
+	while (d < -180) d += 360;
+	return d;
+};
+
+function AngleCalWizard({ t }: { t: 0 | 1 }) {
+	const [step, setStep] = useState(-1); // -1 = 待機, 0..7 = 計測中の方向, 8 = 確認
+	const [now, setNow] = useState({ mag: 0, ang: 0 });
+	const [measured, setMeasured] = useState<number[]>([]);
+	const timer = useRef<ReturnType<typeof setInterval> | 0>(0);
+	const samples = useRef<number[]>([]);
+	const busy = useRef(false);
+
+	const stop = () => { if (timer.current) clearInterval(timer.current); timer.current = 0; };
+	useEffect(() => () => stop(), []);
+
+	const run = (dir: number, acc: number[]) => {
+		stop();
+		setStep(dir);
+		samples.current = [];
+		timer.current = setInterval(async () => {
+			if (busy.current) return;
+			busy.current = true;
+			try {
+				const v = await bs.readStickVec();
+				if (!v || !v.valid) return;
+				const x = v.x[t], y = v.y[t];
+				const mag = Math.hypot(x, y), ang = angleOf(x, y);
+				setNow({ mag, ang });
+				const w = samples.current;
+				if (mag < ANGLE_CAL_MIN_MAG) { w.length = 0; return; }
+				w.push(ang);
+				if (w.length > ANGLE_CAL_STABLE) w.shift();
+				if (w.length < ANGLE_CAL_STABLE) return;
+				const spread = Math.max(...w.map((a) => Math.abs(angDiff(a, w[0]))));
+				if (spread > ANGLE_CAL_SPREAD) return;
+				// 円周上の平均
+				const sx = w.reduce((s, a) => s + Math.sin(a * Math.PI / 180), 0);
+				const cx = w.reduce((s, a) => s + Math.cos(a * Math.PI / 180), 0);
+				let mean = Math.atan2(sx, cx) * 180 / Math.PI;
+				if (mean < 0) mean += 360;
+				const next = [...acc, mean];
+				setMeasured(next);
+				if (dir + 1 < CAL_DIRS.length) run(dir + 1, next);
+				else { stop(); setStep(8); }
+			} finally {
+				busy.current = false;
+			}
+		}, 50);
+	};
+
+	const targets = measured.map((a) => ((Math.round(a / 45) * 45) % 360 + 360) % 360);
+	const distinct = new Set(targets).size === CAL_DIRS.length;
+	const maxErr = measured.length ? Math.max(...measured.map((a, i) => Math.abs(angDiff(a, targets[i])))) : 0;
+
+	const write = () => {
+		const pairs = measured.map((a, i) => [a, targets[i]]).sort((p, q) => p[0] - q[0]);
+		pairs.forEach(([a, tg], i) => {
+			bs.setParam(t, SP.angleMapIn100, i, Math.round(a * 100));
+			bs.setParam(t, SP.angleMapOut100, i, Math.round(tg * 100));
+			bs.setParam(t, SP.angleMapDz100, i, 0);
+		});
+		bs.setParam(t, SP.angleMapCount, 0, pairs.length);
+		bs.setParam(t, SP.angleMapEnable, 0, (1 << pairs.length) - 1);
+		setStep(-1);
+		setMeasured([]);
+	};
+	const cancel = () => { stop(); setStep(-1); setMeasured([]); };
+
 	return (
 		<div className="card">
-			<SliderRow t={t} id={SP.angleOffset100} label="全体回転 (度)" min={-180} max={180} scale={100} step={0.5} />
-			<SelectRow t={t} id={SP.angleSnap} label="角度スナップ"
-				options={[[0, 'オフ'], [1, '45度'], [2, '90度']]} />
-			<div className="hr" />
-			<AngleMapTable t={t} />
+			<h3>8 方向の角度キャリブレーション</h3>
+			{step === -1 && (
+				<>
+					<div className="note">
+						スティックを 8 方向それぞれに倒し切って、各方向で 0.5 秒ほど止めます。測った角度が
+						正確な 45 度刻みになるよう、角度マップ（8 点）を書き込みます。今の角度マップは上書きされます。
+					</div>
+					<div className="row"><label></label><button onClick={() => run(0, [])}>開始</button></div>
+				</>
+			)}
+			{step >= 0 && step < 8 && (
+				<>
+					<div className="note">
+						<b>{CAL_DIRS[step]}</b> に倒し切って止めてください（{step + 1} / 8）。止まると自動で次へ進みます。
+					</div>
+					<div className="vals">{'大きさ ' + (now.mag * 100).toFixed(0) + '%  角度 ' + now.ang.toFixed(1) + '°'}</div>
+					<div className="row"><label></label><button onClick={cancel}>キャンセル</button></div>
+				</>
+			)}
+			{step === 8 && (
+				<>
+					<table className="pts">
+						<thead><tr><th>方向</th><th>測定角</th><th>目標角</th><th>ずれ</th></tr></thead>
+						<tbody>
+							{measured.map((a, i) => (
+								<tr key={i}><td>{CAL_DIRS[i]}</td><td>{a.toFixed(2)}°</td><td>{targets[i]}°</td>
+									<td>{angDiff(a, targets[i]).toFixed(2)}°</td></tr>
+							))}
+						</tbody>
+					</table>
+					{!distinct ? (
+						<div className="note" style={{ color: 'var(--err)' }}>
+							8 方向が区別できませんでした（同じ方向が 2 回測られています）。やり直してください。
+						</div>
+					) : (
+						<div className="note">最大のずれ {maxErr.toFixed(2)}°。書き込んだ後、ライブビューで確認して「本体に保存」してください。</div>
+					)}
+					<div className="row">
+						<button className="primary" onClick={write} disabled={!distinct}>書き込み</button>
+						<button onClick={() => { setMeasured([]); run(0, []); }}>やり直す</button>
+						<button onClick={cancel}>キャンセル</button>
+					</div>
+				</>
+			)}
 		</div>
 	);
 }
+
 
 // ガイド付き自動キャリブレーション:
 //   1) 中央で2秒静止 -> center を平均から取得

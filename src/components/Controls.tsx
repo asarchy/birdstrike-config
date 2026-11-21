@@ -65,18 +65,24 @@ export function SelectRow({ t, id, label, options }:
 }
 
 // X/Y ペア配列 + ポイント数スライダー (感度カーブ / RC 速度カーブ用)
-export function PointsTable({ t, idX, idY, idCount, maxPts, countLabel, xLabel, yLabel }: {
+// base: 配列の先頭 index (カーブ枠のオフセット), countIdx: ポイント数の index,
+// scale: 保存値 / 表示値 (0.1% 単位なら 10), step: 入力の刻み
+export function PointsTable({ t, idX, idY, idCount, maxPts, countLabel, xLabel, yLabel,
+	base = 0, countIdx = 0, scale = 1, step = 1 }: {
 	t: number; idX: number; idY: number; idCount: number; maxPts: number;
 	countLabel: string; xLabel: string; yLabel: string;
+	base?: number; countIdx?: number; scale?: number; step?: number;
 }) {
 	useConfig();
-	const count = Math.min(bs.getVal(t, idCount) || 1, maxPts);
+	const count = Math.min(bs.getVal(t, idCount, countIdx) || 1, maxPts);
+	const set = (id: number, i: number, v: string) =>
+		bs.setParam(t, id, base + i, Math.round((+v || 0) * scale));
 	return (
 		<div>
 			<div className="row">
 				<label>{countLabel}</label>
 				<input type="range" min={1} max={maxPts} step={1} value={count}
-					onChange={(e) => bs.setParam(t, idCount, 0, +e.target.value)} />
+					onChange={(e) => bs.setParam(t, idCount, countIdx, +e.target.value)} />
 				<span>{count}</span>
 			</div>
 			<table className="pts">
@@ -87,10 +93,10 @@ export function PointsTable({ t, idX, idY, idCount, maxPts, countLabel, xLabel, 
 					{Array.from({ length: count }, (_, i) => (
 						<tr key={i}>
 							<td>{i + 1}</td>
-							<td><input type="number" value={bs.getVal(t, idX, i)}
-								onChange={(e) => bs.setParam(t, idX, i, Math.round(+e.target.value || 0))} /></td>
-							<td><input type="number" value={bs.getVal(t, idY, i)}
-								onChange={(e) => bs.setParam(t, idY, i, Math.round(+e.target.value || 0))} /></td>
+							<td><input type="number" step={step} value={bs.getVal(t, idX, base + i) / scale}
+								onChange={(e) => set(idX, i, e.target.value)} /></td>
+							<td><input type="number" step={step} value={bs.getVal(t, idY, base + i) / scale}
+								onChange={(e) => set(idY, i, e.target.value)} /></td>
 						</tr>
 					))}
 				</tbody>

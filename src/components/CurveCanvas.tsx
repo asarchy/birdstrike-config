@@ -1,6 +1,6 @@
 // 感度カーブのプレビュー描画
 import { useEffect, useRef } from 'react';
-import { bs, useConfig, CURVE_PRESETS, SP } from '../birdstrike';
+import { bs, useConfig, CURVE_PRESETS, SP, CURVE_SLOT_POINTS } from '../birdstrike';
 
 const PAD = 7; // 端のポイント/マーカーが切れないための内側余白
 
@@ -38,7 +38,13 @@ export function CurveCanvas({ stick }: { stick: 0 | 1 }) {
 
 		const preset = bs.getVal(stick, SP.curvePreset);
 		let pts: number[][];
-		if (preset >= 5) {
+		if (preset >= 5 && bs.hasV5) {
+			// ch v5 カスタム 4 枠 (0.1% 単位): マーカー間のみを結ぶ
+			const base = Math.min(preset - 5, 3) * CURVE_SLOT_POINTS;
+			const n = Math.min(bs.getVal(stick, SP.curvesCount, preset - 5) || 1, CURVE_SLOT_POINTS);
+			pts = Array.from({ length: n }, (_, i) =>
+				[bs.getVal(stick, SP.curvesX, base + i) / 10, bs.getVal(stick, SP.curvesY, base + i) / 10]);
+		} else if (preset >= 5) {
 			// カスタム: マーカー間のみを結ぶ
 			const n = Math.min(bs.getVal(stick, SP.curvePointCount) || 1, 10);
 			pts = Array.from({ length: n }, (_, i) =>

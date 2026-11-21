@@ -27,7 +27,7 @@ export const INPUT_MODES: [number, string][] = [
 	[14, 'Generic HID (DInput)'],
 	[3, 'キーボード'],
 ];
-const SEL_INFO = 0x00, SEL_RAW = 0x01, SEL_DUMP = 0x03, SEL_HOST = 0x04;
+const SEL_INFO = 0x00, SEL_RAW = 0x01, SEL_DUMP = 0x03, SEL_HOST = 0x04, SEL_STICKVEC = 0x06;
 
 // 基板の種類 (INFO byte 10)。コンバーターはスティックが USB ホストにつないだ
 // コントローラーから来るので、専用の画面が要る
@@ -52,7 +52,12 @@ export const SP = {
 	innerX: 31, innerY: 32, outerX: 33, outerY: 34, antiX: 35, antiY: 36,
 	resolution: 37, delayMs: 38, angleOffset100: 39, angleSnap: 40, angleMapCount: 41,
 	angleMapIn100: 42, angleMapOut100: 43, angleMapDz100: 44, angleMapEnable: 45,
+	// ch v5: カスタムカーブ 4 枠 (0.1% 単位, index = 枠*10 + 点), オーバーサンプリング
+	curvesX: 46, curvesY: 47, curvesCount: 48, oversampling: 49,
 } as const;
+
+// ch v5 のカスタムカーブ: 1 枠あたりの最大点数
+export const CURVE_SLOT_POINTS = 10;
 
 export const GP = {
 	enabled: 1, chLX: 2, chLY: 3, chRX: 4, chRY: 5, chPsButton: 6,
@@ -70,6 +75,17 @@ export const CURVE_PRESETS: Record<number, { label: string; pts: number[][] }> =
 	4: { label: 'スムーズスタート (Smooth start)', pts: [[30, 25], [70, 75], [100, 100]] },
 	5: { label: 'カスタム (Custom)', pts: [] },
 };
+
+// ch v5 以降: カスタムは 4 枠 (FireBird A* と同じく 5..8)
+export const CURVE_PRESETS_V5: [number, string][] = [
+	...Object.entries(CURVE_PRESETS).filter(([v]) => +v < 5).map(([v, p]) => [+v, p.label] as [number, string]),
+	[5, 'カスタム 1'], [6, 'カスタム 2'], [7, 'カスタム 3'], [8, 'カスタム 4'],
+];
+
+// オーバーサンプリング (2^n 回の移動平均)
+export const OVERSAMPLING: [number, string][] = [
+	[0, 'オフ'], [1, '2 回平均'], [2, '4 回平均'], [3, '8 回平均'], [4, '16 回平均'],
+];
 
 export interface Status {
 	text: string;
@@ -373,6 +389,23 @@ class Birdstrike {
 	}
 
 	get isConverter() { return this.boardKind === BOARD_CONVERTER; }
+
+	// ch v5: カスタムカーブ 4 枠・オーバーサンプリング・角度キャリブレーション
+	get hasV5() { return this.protocolVersion >= 5 && !this.isConverter; }
+
+	// 角度補正直前のスティックベクトル (-1..1)。角度キャリブレーション用 (ch v5)
+	async readStickVec(): Promise<{ valid: boolean; x: [number, number]; y: [number, number] } | null> {
+		if (!this.device || !this.hasV5) return null;
+		return this.enqueue(async () => {
+			await this.select(SEL_STICKVEC);
+			const dv = await this.receiveReport();
+			if (dv.getUint8(0) !== SEL_STICKVEC) return null;
+			const v = (o: number) => dv.getInt16(o, true) / 32767;
+			const x: [number, number] = [v(2), v(6)];
+			const y: [number, number] = [v(4), v(8)];
+			return { valid: dv.getUint8(1) !== 0, x, y };
+		}).catch(() => null);
+	}
 
 	// --- ゲート較正 ---
 	// 手順: calStart → スティックから手を離して中心を取らせる → ゲートに沿って
