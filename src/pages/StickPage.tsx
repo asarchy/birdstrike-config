@@ -204,9 +204,11 @@ function AngleSection({ t }: { t: 0 | 1 }) {
 // 目標角は測定角を 45 度単位に丸めて決めるので、ファーム側の角度の取り方
 // (0 度がどちらか) に依存しない。
 const CAL_DIRS = ['上', '右上', '右', '右下', '下', '左下', '左', '左上'];
-const ANGLE_CAL_MIN_MAG = 0.85;  // 倒し切りとみなす大きさ
+const ANGLE_CAL_MIN_MAG = 0.8;   // 倒し切りとみなす大きさ
 const ANGLE_CAL_STABLE = 10;     // 連続サンプル数 (50ms 間隔 = 0.5 秒)
-const ANGLE_CAL_SPREAD = 2.0;    // その間の角度のばらつき上限 (度)
+const ANGLE_CAL_SPREAD = 5.0;    // その間の角度のばらつき上限 (度)。指の揺れを許す
+const ANGLE_CAL_MIN_SEP = 20;    // 記録済みの方向からこれ以上離れていること (度)
+const ANGLE_CAL_MANUAL_MIN = 3;  // 手動記録に必要なサンプル数
 
 const angleOf = (x: number, y: number) => {
 	// ファームと同じ: atan2(x, y)、0..360
@@ -219,20 +221,46 @@ const angDiff = (a: number, b: number) => {
 	while (d < -180) d += 360;
 	return d;
 };
+const circMean = (w: number[]) => {
+	const sx = w.reduce((s, a) => s + Math.sin(a * Math.PI / 180), 0);
+	const cx = w.reduce((s, a) => s + Math.cos(a * Math.PI / 180), 0);
+	const m = Math.atan2(sx, cx) * 180 / Math.PI;
+	return m < 0 ? m + 360 : m;
+};
+// 円周平均からの最大のずれ
+const circSpread = (w: number[]) => {
+	if (!w.length) return 0;
+	const m = circMean(w);
+	return Math.max(...w.map((a) => Math.abs(angDiff(a, m))));
+};
+
+interface CalLive { mag: number; ang: number; spread: number; held: number; msg: string; ok: boolean }
 
 function AngleCalWizard({ t }: { t: 0 | 1 }) {
 	const [step, setStep] = useState(-1); // -1 = 待機, 0..7 = 計測中の方向, 8 = 確認
-	const [now, setNow] = useState({ mag: 0, ang: 0 });
+	const [now, setNow] = useState<CalLive>({ mag: 0, ang: 0, spread: 0, held: 0, msg: '', ok: false });
 	const [measured, setMeasured] = useState<number[]>([]);
 	const timer = useRef<ReturnType<typeof setInterval> | 0>(0);
 	const samples = useRef<number[]>([]);
+	const accRef = useRef<number[]>([]);
+	const stepRef = useRef(-1);
 	const busy = useRef(false);
 
 	const stop = () => { if (timer.current) clearInterval(timer.current); timer.current = 0; };
 	useEffect(() => () => stop(), []);
 
+	const record = (dir: number, ang: number) => {
+		const next = [...accRef.current, ang];
+		accRef.current = next;
+		setMeasured(next);
+		if (dir + 1 < CAL_DIRS.length) run(dir + 1, next);
+		else { stop(); stepRef.current = 8; setStep(8); }
+	};
+
 	const run = (dir: number, acc: number[]) => {
 		stop();
+		accRef.current = acc;
+		stepRef.current = dir;
 		setStep(dir);
 		samples.current = [];
 		timer.current = setInterval(async () => {
@@ -240,30 +268,36 @@ function AngleCalWizard({ t }: { t: 0 | 1 }) {
 			busy.current = true;
 			try {
 				const v = await bs.readStickVec();
-				if (!v || !v.valid) return;
+				if (!v || !v.valid || stepRef.current !== dir) return;
 				const x = v.x[t], y = v.y[t];
 				const mag = Math.hypot(x, y), ang = angleOf(x, y);
-				setNow({ mag, ang });
 				const w = samples.current;
-				if (mag < ANGLE_CAL_MIN_MAG) { w.length = 0; return; }
+				const live = (spread: number, msg: string, ok = false) =>
+					setNow({ mag, ang, spread, held: w.length, msg, ok });
+				if (mag < ANGLE_CAL_MIN_MAG) { w.length = 0; live(0, 'もっと倒してください'); return; }
+				const near = accRef.current.find((a) => Math.abs(angDiff(ang, a)) < ANGLE_CAL_MIN_SEP);
+				if (near !== undefined) { w.length = 0; live(0, '記録済みの方向と同じです。次の方向へ倒してください'); return; }
 				w.push(ang);
 				if (w.length > ANGLE_CAL_STABLE) w.shift();
-				if (w.length < ANGLE_CAL_STABLE) return;
-				const spread = Math.max(...w.map((a) => Math.abs(angDiff(a, w[0]))));
-				if (spread > ANGLE_CAL_SPREAD) return;
-				// 円周上の平均
-				const sx = w.reduce((s, a) => s + Math.sin(a * Math.PI / 180), 0);
-				const cx = w.reduce((s, a) => s + Math.cos(a * Math.PI / 180), 0);
-				let mean = Math.atan2(sx, cx) * 180 / Math.PI;
-				if (mean < 0) mean += 360;
-				const next = [...acc, mean];
-				setMeasured(next);
-				if (dir + 1 < CAL_DIRS.length) run(dir + 1, next);
-				else { stop(); setStep(8); }
+				const spread = circSpread(w);
+				if (spread > ANGLE_CAL_SPREAD) {
+					// 揺れたら古いサンプルを捨てて数え直す
+					while (w.length > 1 && circSpread(w) > ANGLE_CAL_SPREAD) w.shift();
+					live(spread, 'ぶれています。そのまま止めてください');
+					return;
+				}
+				if (w.length < ANGLE_CAL_STABLE) { live(spread, '止めたまま待ってください', true); return; }
+				record(dir, circMean(w));
 			} finally {
 				busy.current = false;
 			}
 		}, 50);
+	};
+
+	const recordNow = () => {
+		const w = samples.current;
+		if (step < 0 || step >= 8 || w.length < ANGLE_CAL_MANUAL_MIN) return;
+		record(step, circMean(w));
 	};
 
 	const targets = measured.map((a) => ((Math.round(a / 45) * 45) % 360 + 360) % 360);
@@ -279,10 +313,12 @@ function AngleCalWizard({ t }: { t: 0 | 1 }) {
 		});
 		bs.setParam(t, SP.angleMapCount, 0, pairs.length);
 		bs.setParam(t, SP.angleMapEnable, 0, (1 << pairs.length) - 1);
+		stepRef.current = -1;
 		setStep(-1);
 		setMeasured([]);
 	};
-	const cancel = () => { stop(); setStep(-1); setMeasured([]); };
+	const cancel = () => { stop(); stepRef.current = -1; setStep(-1); setMeasured([]); };
+	const restart = () => { setMeasured([]); run(0, []); };
 
 	return (
 		<div className="card">
@@ -300,9 +336,17 @@ function AngleCalWizard({ t }: { t: 0 | 1 }) {
 				<>
 					<div className="note">
 						<b>{CAL_DIRS[step]}</b> に倒し切って止めてください（{step + 1} / 8）。止まると自動で次へ進みます。
+						自動で進まないときは、倒したまま「今の角度で記録」を押してください。
 					</div>
-					<div className="vals">{'大きさ ' + (now.mag * 100).toFixed(0) + '%  角度 ' + now.ang.toFixed(1) + '°'}</div>
-					<div className="row"><label></label><button onClick={cancel}>キャンセル</button></div>
+					<div className="vals">
+						{'大きさ ' + (now.mag * 100).toFixed(0) + '%  角度 ' + now.ang.toFixed(1) + '°  ぶれ ' +
+							now.spread.toFixed(1) + '°  ' + Math.min(now.held, ANGLE_CAL_STABLE) + '/' + ANGLE_CAL_STABLE}
+					</div>
+					<div className="note" style={{ color: now.ok ? 'var(--ok)' : 'var(--err)' }}>{now.msg}</div>
+					<div className="row">
+						<button className="primary" onClick={recordNow} disabled={now.held < ANGLE_CAL_MANUAL_MIN}>今の角度で記録</button>
+						<button onClick={cancel}>キャンセル</button>
+					</div>
 				</>
 			)}
 			{step === 8 && (
@@ -325,7 +369,7 @@ function AngleCalWizard({ t }: { t: 0 | 1 }) {
 					)}
 					<div className="row">
 						<button className="primary" onClick={write} disabled={!distinct}>書き込み</button>
-						<button onClick={() => { setMeasured([]); run(0, []); }}>やり直す</button>
+						<button onClick={restart}>やり直す</button>
 						<button onClick={cancel}>キャンセル</button>
 					</div>
 				</>
